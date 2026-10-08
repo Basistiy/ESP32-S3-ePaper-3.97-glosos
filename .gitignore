@@ -28,3 +28,8 @@ esp_env/
 # Raw firmware dumps & logs
 *.bin
 *.log
+
+# Audio recordings
+recording_*.wav
+*.wav
+recordings/

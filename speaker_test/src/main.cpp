@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <math.h>
 #include "driver/i2s.h"
+#include "esp_heap_caps.h"
 #include "es8311.h"
 #include "music.h"
 
@@ -17,13 +18,25 @@
 #define I2S_DIN_PIN      21
 #define PA_CTRL_PIN      39
 
+// Hardware Button Definitions (Active LOW with internal pull-ups)
+#define BUTTON_BOOT_PIN   0   // Onboard BOOT button
+#define BUTTON_WHEEL_PIN  5   // Onboard Rotary Wheel Center/Function click
+#define BUTTON_UP_PIN     4   // Rotary Up
+#define BUTTON_DOWN_PIN   6   // Rotary Down
+
 #define SAMPLE_RATE      24000
 #define MCLK_MULTIPLE    256
 #define MCLK_FREQ_HZ     (SAMPLE_RATE * MCLK_MULTIPLE)
 
 static es8311_handle_t es_handle = NULL;
 static int current_volume = 80;
+static int current_mic_gain = ES8311_MIC_GAIN_30DB; // +30dB
 static bool pa_enabled = true;
+
+// PSRAM Recording Buffer (stores up to 15 seconds of 24kHz 16-bit mono PCM)
+static int16_t *g_recorded_audio = NULL;
+static size_t g_max_record_samples = SAMPLE_RATE * 15;
+static size_t g_recorded_count = 0;
 
 void scanI2C() {
     Serial.println("\n--- Scanning I2C bus (SDA=41, SCL=42) ---");
@@ -73,14 +86,16 @@ bool initCodec() {
 
     es8311_voice_volume_set(es_handle, current_volume, NULL);
     es8311_microphone_config(es_handle, false);
-    Serial.printf("  ES8311 initialized successfully. Volume: %d%%\n", current_volume);
+    es8311_microphone_gain_set(es_handle, (es8311_mic_gain_t)current_mic_gain);
+    Serial.printf("  ES8311 initialized successfully. Volume: %d%%, Mic Gain: +%ddB\n",
+                  current_volume, current_mic_gain * 6);
     return true;
 }
 
 bool initI2S() {
-    Serial.println("[2/3] Initializing I2S peripheral...");
+    Serial.println("[2/3] Initializing I2S peripheral (TX & RX)...");
     i2s_config_t i2s_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX),
         .sample_rate = SAMPLE_RATE,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
         .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
@@ -106,7 +121,7 @@ bool initI2S() {
         .bck_io_num = I2S_BCK_PIN,
         .ws_io_num = I2S_LRCK_PIN,
         .data_out_num = I2S_DOUT_PIN,
-        .data_in_num = I2S_PIN_NO_CHANGE
+        .data_in_num = I2S_DIN_PIN
     };
 
     err = i2s_set_pin(I2S_NUM, &pin_config);
@@ -115,7 +130,7 @@ bool initI2S() {
         return false;
     }
 
-    Serial.println("  I2S driver installed (MCLK=13, BCK=14, WS=47, DOUT=48).");
+    Serial.println("  I2S driver installed (MCLK=13, BCK=14, WS=47, DOUT=48, DIN=21).");
     return true;
 }
 
@@ -263,14 +278,205 @@ void handleStreamAudio() {
     Serial.printf("STREAM_DONE:%u\n", total_samples);
 }
 
+void recordAudioSession(bool triggered_by_button) {
+    Serial.println("\n>>> Starting Audio Recording...");
+
+    // Optional short start pip for auditory feedback
+    if (pa_enabled) {
+        digitalWrite(PA_CTRL_PIN, HIGH);
+        playTone(1200.0f, 40, 0.3f);
+        delay(20);
+    }
+
+    // Disable PA during recording to eliminate speaker hiss/feedback
+    digitalWrite(PA_CTRL_PIN, LOW);
+    delay(20);
+
+    // Ensure microphone is properly configured with current gain
+    if (es_handle) {
+        es8311_microphone_config(es_handle, false);
+        es8311_microphone_gain_set(es_handle, (es8311_mic_gain_t)current_mic_gain);
+    }
+
+    // Flush RX DMA buffer to remove any stale samples
+    i2s_zero_dma_buffer(I2S_NUM);
+    size_t dummy_bytes = 0;
+    int16_t dummy_buf[256];
+    for (int i = 0; i < 4; i++) {
+        i2s_read(I2S_NUM, dummy_buf, sizeof(dummy_buf), &dummy_bytes, pdMS_TO_TICKS(30));
+    }
+
+    // Send recording start banner over USB Serial
+    Serial.println("RECORD_START:24000:1:16");
+
+    g_recorded_count = 0;
+    const int CHUNK = 256;
+    int16_t rx_stereo[CHUNK * 2];
+    int16_t tx_mono[CHUNK];
+
+    uint32_t start_time = millis();
+    uint32_t max_duration_ms = 30000; // 30s maximum timeout
+    int active_channel = -1; // Auto-detect 0 (Left) or 1 (Right)
+    bool is_push_to_talk = false;
+    bool button_was_released = false;
+
+    while (millis() - start_time < max_duration_ms) {
+        // Read 16-bit interleaved stereo samples from I2S
+        size_t bytes_read = 0;
+        esp_err_t err = i2s_read(I2S_NUM, rx_stereo, sizeof(rx_stereo), &bytes_read, pdMS_TO_TICKS(100));
+        if (err != ESP_OK || bytes_read == 0) {
+            continue;
+        }
+
+        int frames_read = bytes_read / (sizeof(int16_t) * 2);
+
+        // Auto-detect which channel holds the microphone data on the first frames
+        if (active_channel < 0 && frames_read > 32) {
+            int64_t mag_l = 0, mag_r = 0;
+            for (int i = 0; i < frames_read; i++) {
+                mag_l += abs((int32_t)rx_stereo[i * 2]);
+                mag_r += abs((int32_t)rx_stereo[i * 2 + 1]);
+            }
+            active_channel = (mag_l >= mag_r) ? 0 : 1;
+        }
+
+        int ch_offset = (active_channel >= 0) ? active_channel : 0;
+        for (int i = 0; i < frames_read; i++) {
+            tx_mono[i] = rx_stereo[i * 2 + ch_offset];
+        }
+
+        // Stream framed packet to Mac over USB Serial: 0xAA 0x55 <len_lo> <len_hi> <pcm...>
+        uint8_t pkt_hdr[4];
+        pkt_hdr[0] = 0xAA;
+        pkt_hdr[1] = 0x55;
+        pkt_hdr[2] = (uint8_t)(frames_read & 0xFF);
+        pkt_hdr[3] = (uint8_t)((frames_read >> 8) & 0xFF);
+        Serial.write(pkt_hdr, 4);
+        Serial.write((const uint8_t *)tx_mono, frames_read * sizeof(int16_t));
+
+        // Save into PSRAM buffer if space available
+        if (g_recorded_audio && (g_recorded_count + frames_read <= g_max_record_samples)) {
+            memcpy(&g_recorded_audio[g_recorded_count], tx_mono, frames_read * sizeof(int16_t));
+            g_recorded_count += frames_read;
+        }
+
+        // Button state handling
+        if (triggered_by_button) {
+            bool btn_down = (digitalRead(BUTTON_BOOT_PIN) == LOW) || (digitalRead(BUTTON_WHEEL_PIN) == LOW);
+            uint32_t elapsed = millis() - start_time;
+
+            if (elapsed > 350 && btn_down) {
+                // Button held > 350ms: activate Push-to-Talk mode
+                is_push_to_talk = true;
+            }
+
+            if (is_push_to_talk) {
+                // Push-to-Talk: stop immediately when user releases button
+                if (!btn_down) {
+                    delay(20);
+                    if ((digitalRead(BUTTON_BOOT_PIN) == HIGH) && (digitalRead(BUTTON_WHEEL_PIN) == HIGH)) {
+                        break;
+                    }
+                }
+            } else {
+                // Tap mode:
+                if (!btn_down) {
+                    button_was_released = true;
+                }
+                // Second tap stops early
+                if (button_was_released && btn_down && elapsed > 400) {
+                    delay(30);
+                    break;
+                }
+                // Default tap duration: 5 seconds
+                if (elapsed >= 5000) {
+                    break;
+                }
+            }
+        }
+
+        // Allow stopping via serial input ('s', 'q', or newline)
+        if (Serial.available()) {
+            char c = Serial.peek();
+            if (c == 's' || c == 'S' || c == 'q' || c == 'Q' || c == '\n' || c == '\r') {
+                Serial.read();
+                break;
+            }
+        }
+    }
+
+    // Send clean End-of-Stream packet: 0xAA 0x55 0x00 0x00
+    uint8_t eos[4] = { 0xAA, 0x55, 0x00, 0x00 };
+    Serial.write(eos, 4);
+    Serial.flush();
+
+    Serial.printf("\nRECORD_DONE:%u\n", g_recorded_count);
+
+    // Re-enable PA
+    if (pa_enabled) {
+        digitalWrite(PA_CTRL_PIN, HIGH);
+        delay(20);
+        // Play quick completion beep
+        playTone(800.0f, 40, 0.3f);
+    }
+
+    Serial.printf(">>> Audio recording finished (%u samples, %.2f s). Streamed over USB!\n",
+                  g_recorded_count, (float)g_recorded_count / SAMPLE_RATE);
+}
+
+void playRecordedAudio() {
+    if (!g_recorded_audio || g_recorded_count == 0) {
+        Serial.println(">>> No recorded audio in buffer to play!");
+        return;
+    }
+    Serial.printf(">>> Playing last recorded audio (%u samples, %.2f s)...\n",
+                  g_recorded_count, (float)g_recorded_count / SAMPLE_RATE);
+
+    const int CHUNK = 512;
+    int16_t stereo_buf[CHUNK * 2];
+    uint32_t samples_played = 0;
+
+    while (samples_played < g_recorded_count) {
+        int count = min((uint32_t)CHUNK, (uint32_t)(g_recorded_count - samples_played));
+        for (int i = 0; i < count; i++) {
+            int16_t val = g_recorded_audio[samples_played + i];
+            stereo_buf[i * 2]     = val;
+            stereo_buf[i * 2 + 1] = val;
+        }
+        size_t bytes_written = 0;
+        i2s_write(I2S_NUM, stereo_buf, count * sizeof(int16_t) * 2, &bytes_written, portMAX_DELAY);
+        samples_played += count;
+    }
+    Serial.println(">>> Recorded audio playback finished.");
+}
+
 void setup() {
     Serial.begin(115200);
     Serial.setRxBufferSize(8192);
     delay(1000); // Allow USB Serial to attach
 
     Serial.println("\r\n==========================================");
-    Serial.println("  ESP32-S3 e-Paper 3.97 Speaker Test");
+    Serial.println("  ESP32-S3 e-Paper 3.97 Audio & Mic Engine");
     Serial.println("==========================================");
+
+    // Initialize Buttons (Active LOW with internal pull-up resistors)
+    pinMode(BUTTON_BOOT_PIN, INPUT_PULLUP);
+    pinMode(BUTTON_WHEEL_PIN, INPUT_PULLUP);
+    pinMode(BUTTON_UP_PIN, INPUT_PULLUP);
+    pinMode(BUTTON_DOWN_PIN, INPUT_PULLUP);
+    Serial.println("Buttons initialized (BOOT=GPIO 0, WHEEL=GPIO 5, UP=4, DOWN=6).");
+
+    // Allocate PSRAM Recording Buffer
+    g_recorded_audio = (int16_t *)heap_caps_malloc(g_max_record_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!g_recorded_audio) {
+        Serial.println("  WARNING: Could not allocate 15s in PSRAM, falling back to internal RAM (5s)");
+        g_max_record_samples = SAMPLE_RATE * 5;
+        g_recorded_audio = (int16_t *)malloc(g_max_record_samples * sizeof(int16_t));
+    }
+    if (g_recorded_audio) {
+        Serial.printf("  Record buffer allocated: %u samples (%.1f s)\n",
+                      g_max_record_samples, (float)g_max_record_samples / SAMPLE_RATE);
+    }
 
     // Initialize I2C
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 100000);
@@ -299,24 +505,54 @@ void setup() {
     Serial.println();
 
     Serial.println("\n==========================================");
-    Serial.println("Interactive Commands (type in Serial Monitor):");
-    Serial.println("  'S' : USB Audio Stream (stream 24kHz 16-bit mono PCM from Mac)");
-    Serial.println("  '1' : Play test beeps");
+    Serial.println("Interactive Controls:");
+    Serial.println("  [Hardware Button]: Press BOOT (GPIO 0) or Rotary (GPIO 5) to Record");
+    Serial.println("  'R' : Record audio from mic & stream to Mac over USB");
+    Serial.println("  'S' : USB Audio Stream mode (play audio streamed from Mac)");
+    Serial.println("  '4' : Replay last recorded audio on onboard speaker");
+    Serial.println("  '1' : Play diagnostic test beeps");
     Serial.println("  '2' : Play chime melody");
     Serial.println("  '3' : Play onboard music sample track");
-    Serial.println("  '+' : Increase volume (+5%)");
-    Serial.println("  '-' : Decrease volume (-5%)");
+    Serial.println("  '+' : Increase speaker volume (+5%)");
+    Serial.println("  '-' : Decrease speaker volume (-5%)");
+    Serial.println("  'g' : Increase microphone gain (+6dB)");
+    Serial.println("  'G' : Decrease microphone gain (-6dB)");
     Serial.println("  'p' : Toggle Power Amplifier (PA_CTRL)");
     Serial.println("==========================================");
+
+    // Play boot melody
+    playMelody();
 }
 
 void loop() {
+    // Check hardware buttons: BOOT (GPIO 0) or Rotary Wheel Press (GPIO 5)
+    bool btn_boot = (digitalRead(BUTTON_BOOT_PIN) == LOW);
+    bool btn_wheel = (digitalRead(BUTTON_WHEEL_PIN) == LOW);
+    if (btn_boot || btn_wheel) {
+        delay(25); // Debounce
+        if ((digitalRead(BUTTON_BOOT_PIN) == LOW) || (digitalRead(BUTTON_WHEEL_PIN) == LOW)) {
+            recordAudioSession(true);
+            // Wait for button release after session completes
+            while ((digitalRead(BUTTON_BOOT_PIN) == LOW) || (digitalRead(BUTTON_WHEEL_PIN) == LOW)) {
+                delay(10);
+            }
+            delay(100);
+        }
+    }
+
     if (Serial.available()) {
         char cmd = Serial.read();
         switch (cmd) {
             case 's':
             case 'S':
                 handleStreamAudio();
+                break;
+            case 'r':
+            case 'R':
+                recordAudioSession(false);
+                break;
+            case '4':
+                playRecordedAudio();
                 break;
             case '1':
                 playBeeps();
@@ -338,6 +574,18 @@ void loop() {
                 if (es_handle) es8311_voice_volume_set(es_handle, current_volume, NULL);
                 Serial.printf("Volume set to %d%%\n", current_volume);
                 playTone(600.0f, 100, 0.5f);
+                break;
+            case 'g':
+                current_mic_gain = min((int)ES8311_MIC_GAIN_42DB, current_mic_gain + 1);
+                if (es_handle) es8311_microphone_gain_set(es_handle, (es8311_mic_gain_t)current_mic_gain);
+                Serial.printf("Mic Gain increased: index %d (+%ddB)\n", current_mic_gain, current_mic_gain * 6);
+                playTone(1400.0f, 60, 0.3f);
+                break;
+            case 'G':
+                current_mic_gain = max((int)ES8311_MIC_GAIN_0DB, current_mic_gain - 1);
+                if (es_handle) es8311_microphone_gain_set(es_handle, (es8311_mic_gain_t)current_mic_gain);
+                Serial.printf("Mic Gain decreased: index %d (+%ddB)\n", current_mic_gain, current_mic_gain * 6);
+                playTone(700.0f, 60, 0.3f);
                 break;
             case 'p':
             case 'P':
