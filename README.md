@@ -6,7 +6,7 @@ Firmware, display drivers, and real-time USB audio streaming tools for the **Wav
 
 ## 📋 Features
 
-- 🔊 **Audio Subsystem (`speaker_test`)**
+- 🔊 **Audio & USB Control Subsystem (`usb_control`)**
   - **ES8311 Codec Control**: Full initialization over I2C, volume control, microphone gain, and clock management.
   - **Onboard Power Amplifier**: GPIO 39 active-high PA control.
   - **I2S Master Clocking**: 24 kHz 16-bit audio with MCLK output on GPIO 13.
@@ -69,10 +69,10 @@ Firmware, display drivers, and real-time USB audio streaming tools for the **Wav
 
 ```
 ESP32-S3-ePaper-3.97-glosos/
-├── speaker_test/                 # PlatformIO project: Audio codec, PA & streaming receiver
+├── usb_control/                  # PlatformIO project: Audio codec, mic, PA & USB stream controller
 │   ├── platformio.ini
 │   └── src/
-│       ├── main.cpp              # Audio engine, test tones & packet stream receiver
+│       ├── main.cpp              # Audio engine, mic recorder & packet stream receiver
 │       ├── es8311.cpp            # ES8311 driver implementation
 │       ├── es8311.h              # ES8311 register & API definitions
 │       ├── es8311_reg.h          # ES8311 hardware registers
@@ -118,10 +118,10 @@ ESP32-S3-ePaper-3.97-glosos/
 
 ### 1. Flash the Audio & Microphone Firmware
 
-Navigate to the `speaker_test` project and upload:
+Navigate to the `usb_control` project and upload:
 
 ```bash
-cd speaker_test
+cd usb_control
 pio run -t upload
 ```
 
