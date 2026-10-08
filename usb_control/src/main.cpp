@@ -5,6 +5,7 @@
 #include "esp_heap_caps.h"
 #include "es8311.h"
 #include "music.h"
+#include "chat_display.h"
 
 // Hardware Pin Definitions
 #define I2C_SDA_PIN      41
@@ -518,10 +519,76 @@ void setup() {
     Serial.println("  'g' : Increase microphone gain (+6dB)");
     Serial.println("  'G' : Decrease microphone gain (-6dB)");
     Serial.println("  'p' : Toggle Power Amplifier (PA_CTRL)");
+    Serial.println("  /user <text>  : Post user message on e-Paper (Right bubble)");
+    Serial.println("  /agent <text> : Post agent message on e-Paper (Left bubble)");
+    Serial.println("  /clear        : Clear e-Paper chat history");
+    Serial.println("  /rotate       : Toggle display rotation (90° / 270°)");
     Serial.println("==========================================");
+
+    // Initialize e-Paper Chat Display in vertical mode
+    ChatDisplay::begin(ROTATE_270);
 
     // Play boot melody
     playMelody();
+}
+
+static String s_chatSerialBuffer = "";
+
+static void handleAudioCommand(char cmd) {
+    switch (cmd) {
+        case 's':
+        case 'S':
+            handleStreamAudio();
+            break;
+        case 'r':
+        case 'R':
+            recordAudioSession(false);
+            break;
+        case '4':
+            playRecordedAudio();
+            break;
+        case '1':
+            playBeeps();
+            break;
+        case '2':
+            playMelody();
+            break;
+        case '3':
+            playMusicTrack();
+            break;
+        case '+':
+            current_volume = min(100, current_volume + 5);
+            if (es_handle) es8311_voice_volume_set(es_handle, current_volume, NULL);
+            Serial.printf("Volume set to %d%%\n", current_volume);
+            playTone(1000.0f, 100, 0.5f);
+            break;
+        case '-':
+            current_volume = max(0, current_volume - 5);
+            if (es_handle) es8311_voice_volume_set(es_handle, current_volume, NULL);
+            Serial.printf("Volume set to %d%%\n", current_volume);
+            playTone(600.0f, 100, 0.5f);
+            break;
+        case 'g':
+            current_mic_gain = min((int)ES8311_MIC_GAIN_42DB, current_mic_gain + 1);
+            if (es_handle) es8311_microphone_gain_set(es_handle, (es8311_mic_gain_t)current_mic_gain);
+            Serial.printf("Mic Gain increased: index %d (+%ddB)\n", current_mic_gain, current_mic_gain * 6);
+            playTone(1400.0f, 60, 0.3f);
+            break;
+        case 'G':
+            current_mic_gain = max((int)ES8311_MIC_GAIN_0DB, current_mic_gain - 1);
+            if (es_handle) es8311_microphone_gain_set(es_handle, (es8311_mic_gain_t)current_mic_gain);
+            Serial.printf("Mic Gain decreased: index %d (+%ddB)\n", current_mic_gain, current_mic_gain * 6);
+            playTone(700.0f, 60, 0.3f);
+            break;
+        case 'p':
+        case 'P':
+            pa_enabled = !pa_enabled;
+            digitalWrite(PA_CTRL_PIN, pa_enabled ? HIGH : LOW);
+            Serial.printf("Power Amplifier (PA_CTRL) is now %s\n", pa_enabled ? "ENABLED" : "DISABLED");
+            break;
+        default:
+            break;
+    }
 }
 
 void loop() {
@@ -540,62 +607,42 @@ void loop() {
         }
     }
 
-    if (Serial.available()) {
-        char cmd = Serial.read();
-        switch (cmd) {
-            case 's':
-            case 'S':
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\r') continue;
+
+        if (c == '\n') {
+            s_chatSerialBuffer.trim();
+            if (s_chatSerialBuffer.length() > 0) {
+                if (s_chatSerialBuffer.length() == 1) {
+                    handleAudioCommand(s_chatSerialBuffer[0]);
+                } else if (s_chatSerialBuffer.startsWith("/") || s_chatSerialBuffer.startsWith("{") ||
+                           s_chatSerialBuffer.startsWith("USER:") || s_chatSerialBuffer.startsWith("user:") ||
+                           s_chatSerialBuffer.startsWith("AGENT:") || s_chatSerialBuffer.startsWith("agent:") ||
+                           s_chatSerialBuffer.startsWith("u:") || s_chatSerialBuffer.startsWith("a:") ||
+                           s_chatSerialBuffer.equalsIgnoreCase("clear") || s_chatSerialBuffer.equalsIgnoreCase("rotate") ||
+                           s_chatSerialBuffer.equalsIgnoreCase("demo")) {
+                    ChatDisplay::handleCommand(s_chatSerialBuffer);
+                    Serial.println("OK");
+                    Serial.flush();
+                } else {
+                    ChatDisplay::addMessage(SENDER_USER, s_chatSerialBuffer.c_str());
+                    Serial.println("OK");
+                    Serial.flush();
+                }
+            }
+            s_chatSerialBuffer = "";
+        } else {
+            // Check for instantaneous single keystrokes like 'S' for audio stream
+            if (s_chatSerialBuffer.length() == 0 && (c == 's' || c == 'S')) {
                 handleStreamAudio();
-                break;
-            case 'r':
-            case 'R':
-                recordAudioSession(false);
-                break;
-            case '4':
-                playRecordedAudio();
-                break;
-            case '1':
-                playBeeps();
-                break;
-            case '2':
-                playMelody();
-                break;
-            case '3':
-                playMusicTrack();
-                break;
-            case '+':
-                current_volume = min(100, current_volume + 5);
-                if (es_handle) es8311_voice_volume_set(es_handle, current_volume, NULL);
-                Serial.printf("Volume set to %d%%\n", current_volume);
-                playTone(1000.0f, 100, 0.5f);
-                break;
-            case '-':
-                current_volume = max(0, current_volume - 5);
-                if (es_handle) es8311_voice_volume_set(es_handle, current_volume, NULL);
-                Serial.printf("Volume set to %d%%\n", current_volume);
-                playTone(600.0f, 100, 0.5f);
-                break;
-            case 'g':
-                current_mic_gain = min((int)ES8311_MIC_GAIN_42DB, current_mic_gain + 1);
-                if (es_handle) es8311_microphone_gain_set(es_handle, (es8311_mic_gain_t)current_mic_gain);
-                Serial.printf("Mic Gain increased: index %d (+%ddB)\n", current_mic_gain, current_mic_gain * 6);
-                playTone(1400.0f, 60, 0.3f);
-                break;
-            case 'G':
-                current_mic_gain = max((int)ES8311_MIC_GAIN_0DB, current_mic_gain - 1);
-                if (es_handle) es8311_microphone_gain_set(es_handle, (es8311_mic_gain_t)current_mic_gain);
-                Serial.printf("Mic Gain decreased: index %d (+%ddB)\n", current_mic_gain, current_mic_gain * 6);
-                playTone(700.0f, 60, 0.3f);
-                break;
-            case 'p':
-            case 'P':
-                pa_enabled = !pa_enabled;
-                digitalWrite(PA_CTRL_PIN, pa_enabled ? HIGH : LOW);
-                Serial.printf("Power Amplifier (PA_CTRL) is now %s\n", pa_enabled ? "ENABLED" : "DISABLED");
-                break;
-            default:
-                break;
+            } else {
+                if (s_chatSerialBuffer.length() < 512) {
+                    s_chatSerialBuffer += c;
+                }
+            }
         }
     }
+
     delay(10);
 }

@@ -16,12 +16,18 @@ Firmware, display drivers, and real-time USB audio streaming tools for the **Wav
   - **Packet Framing Protocol**: Custom `0xAA 0x55` sync framing that eliminates byte alignment errors and white-noise static.
   - **Onboard Synthesizer & Replay**: Pure sine wave tone generator, chime melodies, flash music, and instant replay of recorded voice.
 
-- 🖼️ **e-Paper Display (`display_firmware`)**
-  - **Waveshare 3.97" e-Paper**: 800×480 resolution driver.
-  - **Dual Mode Support**: Fast 1-bit Black/White mode and 4-Level Grayscale mode.
-  - **Zero Idle Power**: Automatic deep sleep latching after refresh.
+- 🖼️ **e-Paper Chat Display Subsystem (`display_firmware` & `usb_control`)**
+  - **Vertical (Portrait) Orientation**: 480 × 800 layout with title bar, chat history, and status bar.
+  - **Opposing Chat Bubbles**:
+    - **User messages**: Right-aligned solid black bubbles with white text and speech tail.
+    - **Agent messages**: Left-aligned outlined bubbles with black text and speech tail.
+  - **Word Wrapping & Auto-Layout**: Dynamic text wrapping and bubble width/height calculation.
+  - **Automatic Scrolling**: Automatically scrolls older messages off the top when the screen fills up.
+  - **Fast Refresh (1.5s)**: Fast e-Paper updates with minimal flicker.
+  - **Rotation Control**: Instantly flip 180° (90° / 270°) via software command or onboard BOOT button.
 
-- 💻 **Mac Host Audio Streaming & Recording Tools**
+- 💻 **Mac Host Tools**
+  - **`send_chat.py`**: Send user & agent chat messages from Mac over USB, trigger demos, clear screen, or run an interactive terminal chat console.
   - **`record_from_esp32.py`**: Listen for device button presses over USB, capture audio stream to standard `.wav`, and immediately play it on Mac speakers via macOS `afplay`.
   - **`stream_to_esp32.py`**: Stream any sound, speech, or music file (**MP3**, **WAV**, **AIFF**, or macOS TTS `say`) from Mac to the ESP32 speaker.
 
@@ -55,13 +61,12 @@ Firmware, display drivers, and real-time USB audio streaming tools for the **Wav
 
 | Function | ESP32-S3 Pin | Notes |
 | :--- | :--- | :--- |
-| **SPI SCK** | `GPIO 12` | SPI Clock |
-| **SPI MOSI** | `GPIO 11` | SPI Master Out |
+| **SPI SCK** | `GPIO 11` | SPI Clock |
+| **SPI MOSI** | `GPIO 12` | SPI Master Out |
 | **CS** | `GPIO 10` | Chip Select |
 | **DC** | `GPIO 9` | Data / Command Control |
-| **RST** | `GPIO 8` | Hardware Reset |
-| **BUSY** | `GPIO 7` | Busy Status Input |
-| **PWR** | `GPIO 6` | Display Power Switch |
+| **RST** | `GPIO 46` | Hardware Reset |
+| **BUSY** | `GPIO 3` | Busy Status Input |
 
 ---
 
@@ -69,29 +74,35 @@ Firmware, display drivers, and real-time USB audio streaming tools for the **Wav
 
 ```
 ESP32-S3-ePaper-3.97-glosos/
-├── usb_control/                  # PlatformIO project: Audio codec, mic, PA & USB stream controller
+├── usb_control/                  # PlatformIO project: Unified Audio & e-Paper Chat controller
 │   ├── platformio.ini
 │   └── src/
-│       ├── main.cpp              # Audio engine, mic recorder & packet stream receiver
+│       ├── main.cpp              # Audio engine, mic recorder, USB stream & chat receiver
+│       ├── chat_display.h        # Chat display engine header
+│       ├── chat_display.cpp      # Chat UI (bubbles, word wrap, layout, fast refresh)
 │       ├── es8311.cpp            # ES8311 driver implementation
 │       ├── es8311.h              # ES8311 register & API definitions
 │       ├── es8311_reg.h          # ES8311 hardware registers
-│       └── music.h               # Flash PCM music sample (14.5s)
-├── display_firmware/             # PlatformIO project: 3.97" e-Paper display firmware
-│   ├── platformio.ini
-│   └── src/
-│       ├── main.cpp              # Display demo (1-bit / 4-level grayscale)
-│       ├── EPD_3in97.cpp         # 3.97" e-Paper controller
+│       ├── music.h               # Flash PCM music sample (14.5s)
+│       ├── EPD_3in97.cpp         # 3.97" e-Paper display driver
 │       ├── EPD_3in97.h
 │       ├── DEV_Config.cpp        # Hardware SPI & GPIO abstraction
 │       ├── DEV_Config.h
-│       └── image_data.h          # Sample e-Paper bitmap images
-├── images/                       # Sample converted e-Paper images
-│   ├── fit_entire_1bit.png
-│   ├── fit_entire_4gray.png
-│   ├── prominent_1bit.png
-│   ├── prominent_4gray.png
-│   └── ...
+│       ├── GUI_Paint.cpp         # Waveshare paint drawing primitives
+│       ├── fonts.cpp             # Font24 bitmap table (17x24 px)
+│       └── fonts.h               # Font24 bitmap definition
+├── display_firmware/             # PlatformIO project: Standalone 3.97" e-Paper Chat firmware
+│   ├── platformio.ini
+│   └── src/
+│       ├── main.cpp              # Interactive Chat terminal entry point
+│       ├── chat_display.h
+│       ├── chat_display.cpp
+│       ├── EPD_3in97.cpp
+│       ├── EPD_3in97.h
+│       ├── DEV_Config.cpp
+│       ├── DEV_Config.h
+│       └── ...
+├── send_chat.py                  # Mac tool: send user & agent chat bubbles to display over USB
 ├── record_from_esp32.py          # Mac tool: records from ESP32 mic over USB & plays on Mac
 ├── stream_to_esp32.py            # Mac streaming script (FFmpeg / macOS TTS over USB)
 ├── glosos_commands.MP3           # Sample voice command audio track
@@ -206,20 +217,52 @@ python3 stream_to_esp32.py /System/Library/Sounds/Sosumi.aiff
 
 ---
 
-### 4. Flash the e-Paper Display Firmware
+### 4. Send Messages as Chat Bubbles to the e-Paper Display
 
-To test the 3.97-inch e-paper display:
+Messages sent from your Mac are rendered as clean chat bubbles in **vertical (portrait 480×800) orientation**:
+- **Pure Bubble Interface**: All headers, footers, and divider lines are removed — only chat bubbles appear on the canvas.
+- **Bold Font24 Typography**: High-contrast, highly legible 17×24 px bitmap font across all text.
+- **User messages**: Displayed on the **RIGHT** side in solid black bubbles with white text.
+- **Agent messages**: Displayed on the **LEFT** side in crisp outlined bubbles with black text.
+- **Word Wrapping**: Automatically wraps text and calculates bubble width/height.
+- **Auto-Scrolling**: Keeps newest messages in view as chat history grows.
 
+Both `display_firmware` (standalone display) and `usb_control` (unified audio + display) support this!
+
+#### Send a User Message:
 ```bash
-cd display_firmware
-pio run -t upload
+python3 send_chat.py --user "Hello device! Can you hear me?"
 ```
 
-In `display_firmware/src/main.cpp`, you can select between:
-- `#define USE_4GRAY 1` (4-Level Grayscale for photos/artwork)
-- `#define USE_4GRAY 0` (Fast 1-Bit Black & White mode)
+#### Send an Agent Response:
+```bash
+python3 send_chat.py --agent "Yes! I am your AI assistant on the e-Paper display."
+```
 
-Once updated, the e-paper permanently retains the image even after removing power.
+#### Run the Multi-Turn Chat Showcase Demo:
+```bash
+python3 send_chat.py --demo
+```
+
+#### Launch Interactive Chat Console:
+```bash
+python3 send_chat.py --interactive
+```
+In interactive mode:
+- Type any message and press `Enter` to post a **User** bubble (right side).
+- Type `/agent <message>` or `/a <message>` to post an **Agent** bubble (left side).
+- Type `/clear` to clear chat history on screen.
+- Type `/rotate` to flip orientation 180° (90° / 270°).
+- Type `/demo` to run a demo dialogue.
+
+#### Orientation and Screen Controls:
+```bash
+# Clear screen history
+python3 send_chat.py --clear
+
+# Toggle orientation 180 degrees (or press the onboard BOOT button)
+python3 send_chat.py --rotate
+```
 
 ---
 
