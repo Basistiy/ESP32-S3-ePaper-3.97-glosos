@@ -1,0 +1,73 @@
+menu "Waveshare Board Hardware Configuration"
+
+    menu "I2C GPIOs config (ES8311 Control)"
+        config EXAMPLE_I2C_SCL_IO
+            int "SCL pin"
+            default 42
+        config EXAMPLE_I2C_SDA_IO
+            int "SDA pin"
+            default 41
+    endmenu
+
+    menu "I2S GPIOs config (ES8311 Audio Stream)"
+        config EXAMPLE_I2S_MCK_IO
+            int "MCK pin"
+            default 13
+        config EXAMPLE_I2S_BCK_IO
+            int "BCK pin"
+            default 14
+        config EXAMPLE_I2S_WS_IO
+            int "WS pin"
+            default 47
+        config EXAMPLE_I2S_DO_IO
+            int "DOUT pin (ESP32 -> Speaker)"
+            default 48
+        config EXAMPLE_I2S_DI_IO
+            int "DIN pin (Mic -> ESP32)"
+            default 21
+    endmenu
+
+    config EXAMPLE_PA_CTRL_IO
+        int "Power Amplifier Control GPIO (Active HIGH)"
+        default 39
+        help
+            Set GPIO number for NS4150B PA control.
+
+    config EXAMPLE_PLAY_BOOT_CHIME
+        bool "Play startup chime on boot"
+        default y
+        help
+            Play a short diagnostic chime through the speaker upon power-up to verify audio hardware.
+
+    choice EXAMPLE_BIT_WIDTH
+        prompt "Audio data bit width"
+        default BIT_WIDTH_16BIT
+
+        config BIT_WIDTH_16BIT
+            bool "16-bit"
+        config BIT_WIDTH_24BIT
+            bool "24-bit"
+        config BIT_WIDTH_32BIT
+            bool "32-bit"
+    endchoice
+
+    config EXAMPLE_AUDIO_BIT_WIDTH
+        int
+        default 16 if BIT_WIDTH_16BIT
+        default 24 if BIT_WIDTH_24BIT
+        default 32 if BIT_WIDTH_32BIT
+
+    config EXAMPLE_CODEC_MIC_GAIN
+        int "Set MIC gain (unit: dB)"
+        default 24
+        help
+            Microphone pre-amplifier gain in dB.
+
+    config EXAMPLE_CODEC_VOLUME
+        int "Default speaker volume"
+        range 0 100
+        default 90
+        help
+            Default speaker output volume (0-100).
+
+endmenu

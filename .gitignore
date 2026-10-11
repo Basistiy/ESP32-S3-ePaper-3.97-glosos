@@ -3,6 +3,18 @@
 .pioenvs/
 .piolibdeps/
 
+# ESP-IDF
+build/
+**/build/
+managed_components/
+**/managed_components/
+dependencies.lock
+**/dependencies.lock
+sdkconfig
+**/sdkconfig
+sdkconfig.old
+**/sdkconfig.old
+
 # IDE files
 .vscode/
 .idea/
