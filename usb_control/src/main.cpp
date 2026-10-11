@@ -1,11 +1,38 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
+#include <USB.h>
+#include <USBCDC.h>
 #include "driver/i2s.h"
 #include "esp_heap_caps.h"
 #include "es8311.h"
 #include "music.h"
 #include "chat_display.h"
+#include "AudioTools.h"
+#include "AudioTools/Communication/USB/USBAudioStream.h"
+
+#include "soc/usb_struct.h"
+#include "esp32-hal-tinyusb.h"
+
+// TinyUSB Start-of-Frame stub for ESP32-S3 (feedback is handled asynchronously via endpoints)
+extern "C" void dcd_sof_enable(uint8_t rhport, bool en) {
+    (void)rhport;
+    (void)en;
+}
+
+extern "C" void dcd_edpt_close(uint8_t rhport, uint8_t ep_addr) {
+    (void)rhport;
+    (void)ep_addr;
+}
+
+// USB CDC Serial instance for composite device (Audio + CDC Serial)
+USBCDC USBSerial;
+#ifndef Serial
+#define Serial USBSerial
+#endif
+
+// USB Audio Class 2.0 (UAC2) Device Stream (ALSA Speaker + Microphone)
+USBAudioStream usb_audio;
 
 // Hardware Pin Definitions
 #define I2C_SDA_PIN      41
@@ -25,19 +52,23 @@
 #define BUTTON_UP_PIN     4   // Rotary Up
 #define BUTTON_DOWN_PIN   6   // Rotary Down
 
-#define SAMPLE_RATE      24000
+// 48 kHz 16-bit audio standard for universal ALSA / PulseAudio / PipeWire compatibility
+#define SAMPLE_RATE      48000
 #define MCLK_MULTIPLE    256
-#define MCLK_FREQ_HZ     (SAMPLE_RATE * MCLK_MULTIPLE)
+#define MCLK_FREQ_HZ     (SAMPLE_RATE * MCLK_MULTIPLE) // 12.288 MHz
 
 static es8311_handle_t es_handle = NULL;
 static int current_volume = 80;
 static int current_mic_gain = ES8311_MIC_GAIN_30DB; // +30dB
 static bool pa_enabled = true;
+static volatile bool g_local_playback_active = false;
 
-// PSRAM Recording Buffer (stores up to 15 seconds of 24kHz 16-bit mono PCM)
+// PSRAM Recording Buffer (stores up to 15 seconds of 48kHz 16-bit mono PCM)
 static int16_t *g_recorded_audio = NULL;
 static size_t g_max_record_samples = SAMPLE_RATE * 15;
 static size_t g_recorded_count = 0;
+
+static TaskHandle_t s_audio_task_handle = NULL;
 
 void scanI2C() {
     Serial.println("\n--- Scanning I2C bus (SDA=41, SCL=42) ---");
@@ -88,13 +119,13 @@ bool initCodec() {
     es8311_voice_volume_set(es_handle, current_volume, NULL);
     es8311_microphone_config(es_handle, false);
     es8311_microphone_gain_set(es_handle, (es8311_mic_gain_t)current_mic_gain);
-    Serial.printf("  ES8311 initialized successfully. Volume: %d%%, Mic Gain: +%ddB\n",
-                  current_volume, current_mic_gain * 6);
+    Serial.printf("  ES8311 initialized successfully. Rate: %d Hz, Volume: %d%%, Mic Gain: +%ddB\n",
+                  SAMPLE_RATE, current_volume, current_mic_gain * 6);
     return true;
 }
 
 bool initI2S() {
-    Serial.println("[2/3] Initializing I2S peripheral (TX & RX)...");
+    Serial.println("[2/3] Initializing I2S peripheral (TX & RX at 48kHz)...");
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX),
         .sample_rate = SAMPLE_RATE,
@@ -103,7 +134,7 @@ bool initI2S() {
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = 8,
-        .dma_buf_len = 512,
+        .dma_buf_len = 256,
         .use_apll = false,
         .tx_desc_auto_clear = true,
         .fixed_mclk = 0,
@@ -135,7 +166,64 @@ bool initI2S() {
     return true;
 }
 
+// Dedicated background FreeRTOS audio bridge task running on Core 0
+static void audioBridgeTask(void *pvParameters) {
+    const size_t CHUNK = 128; // 128 stereo frames = 512 bytes (~2.67 ms @ 48kHz)
+    static int16_t rx_usb[CHUNK * 2];
+    static int16_t tx_usb[CHUNK * 2];
+    static int16_t i2s_rx[CHUNK * 2];
+
+    while (true) {
+        if (g_local_playback_active) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        bool rx_active = usb_audio.isStreamingActiveRx();
+        bool tx_active = usb_audio.isStreamingActiveTx();
+        bool processed_audio = false;
+
+        // 1. Playback path: USB Host (ALSA / aplay / macOS / Windows) -> ESP32 Speaker
+        if (rx_active) {
+            size_t available_bytes = usb_audio.available();
+            if (available_bytes > 0) {
+                size_t to_read = min(available_bytes, sizeof(rx_usb));
+                size_t bytes_read = usb_audio.readBytes((uint8_t *)rx_usb, to_read);
+                if (bytes_read > 0) {
+                    size_t bytes_written = 0;
+                    i2s_write(I2S_NUM, rx_usb, bytes_read, &bytes_written, pdMS_TO_TICKS(10));
+                    processed_audio = true;
+                }
+            }
+        }
+
+        // 2. Capture path: ES8311 Codec Microphone -> USB Host (ALSA / arecord / macOS)
+        if (tx_active && usb_audio.availableForWrite() >= (int)sizeof(tx_usb)) {
+            size_t bytes_read_i2s = 0;
+            esp_err_t err = i2s_read(I2S_NUM, i2s_rx, sizeof(i2s_rx), &bytes_read_i2s, pdMS_TO_TICKS(10));
+            if (err == ESP_OK && bytes_read_i2s > 0) {
+                size_t samples = bytes_read_i2s / (sizeof(int16_t) * 2);
+
+                for (size_t i = 0; i < samples; i++) {
+                    int16_t l = i2s_rx[i * 2];
+                    int16_t r = i2s_rx[i * 2 + 1];
+                    // Mix whichever channel carries the microphone signal to both stereo channels
+                    int16_t mic_sample = (abs(l) >= abs(r)) ? l : r;
+                    tx_usb[i * 2]     = mic_sample;
+                    tx_usb[i * 2 + 1] = mic_sample;
+                }
+                usb_audio.write((const uint8_t *)tx_usb, samples * sizeof(int16_t) * 2);
+                processed_audio = true;
+            }
+        }
+
+        // Feed FreeRTOS watchdog: sleep for 1 ms on every iteration so Core 0 IDLE task and TWDT always run
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
 void playTone(float freq, int duration_ms, float volume = 0.5f) {
+    g_local_playback_active = true;
     int total_samples = (SAMPLE_RATE * duration_ms) / 1000;
     const int CHUNK = 256;
     int16_t buffer[CHUNK * 2];
@@ -162,6 +250,7 @@ void playTone(float freq, int duration_ms, float volume = 0.5f) {
         i2s_write(I2S_NUM, buffer, count * sizeof(int16_t) * 2, &bytes_written, portMAX_DELAY);
         samples_sent += count;
     }
+    g_local_playback_active = false;
 }
 
 void playMelody() {
@@ -191,31 +280,36 @@ void playBeeps() {
 }
 
 void playMusicTrack() {
+    g_local_playback_active = true;
     Serial.printf(">>> Playing sample music track (%u samples, ~14.5s)...\n", AUDIO_SAMPLES);
-    const int CHUNK = 512;
-    int16_t stereo_buf[CHUNK * 2];
+    const int CHUNK = 256;
+    int16_t stereo_buf[CHUNK * 4]; // 2x upsampled stereo from 24kHz to 48kHz
 
     uint32_t samples_played = 0;
     while (samples_played < AUDIO_SAMPLES) {
         int count = min((uint32_t)CHUNK, AUDIO_SAMPLES - samples_played);
         for (int i = 0; i < count; i++) {
             int16_t val = (int16_t)audio_data[samples_played + i];
-            stereo_buf[i * 2]     = val;
-            stereo_buf[i * 2 + 1] = val;
+            stereo_buf[i * 4]     = val;
+            stereo_buf[i * 4 + 1] = val;
+            stereo_buf[i * 4 + 2] = val;
+            stereo_buf[i * 4 + 3] = val;
         }
         size_t bytes_written = 0;
-        i2s_write(I2S_NUM, stereo_buf, count * sizeof(int16_t) * 2, &bytes_written, portMAX_DELAY);
+        i2s_write(I2S_NUM, stereo_buf, count * sizeof(int16_t) * 4, &bytes_written, portMAX_DELAY);
         samples_played += count;
 
-        if (samples_played % (SAMPLE_RATE * 2) < CHUNK) {
+        if (samples_played % (24000 * 2) < CHUNK) {
             Serial.printf("    Progress: %u / %u samples (%.1f s)\n",
-                          samples_played, AUDIO_SAMPLES, (float)samples_played / SAMPLE_RATE);
+                          samples_played, AUDIO_SAMPLES, (float)samples_played / 24000.0f);
         }
     }
     Serial.println(">>> Music track playback finished.");
+    g_local_playback_active = false;
 }
 
 void handleStreamAudio() {
+    g_local_playback_active = true;
     // Flush any pending bytes in Serial RX buffer (removes newline from 'S\n')
     while (Serial.available()) {
         Serial.read();
@@ -250,7 +344,6 @@ void handleStreamAudio() {
                 sample_count = CHUNK;
             }
 
-            // Read exactly sample_count * 2 bytes of PCM audio
             int bytes_to_read = sample_count * 2;
             int bytes_read = 0;
             uint32_t wait_start = millis();
@@ -277,9 +370,11 @@ void handleStreamAudio() {
         }
     }
     Serial.printf("STREAM_DONE:%u\n", total_samples);
+    g_local_playback_active = false;
 }
 
 void recordAudioSession(bool triggered_by_button) {
+    g_local_playback_active = true;
     Serial.println("\n>>> Starting Audio Recording...");
 
     // Optional short start pip for auditory feedback
@@ -308,7 +403,7 @@ void recordAudioSession(bool triggered_by_button) {
     }
 
     // Send recording start banner over USB Serial
-    Serial.println("RECORD_START:24000:1:16");
+    Serial.printf("RECORD_START:%d:1:16\n", SAMPLE_RATE);
 
     g_recorded_count = 0;
     const int CHUNK = 256;
@@ -346,7 +441,7 @@ void recordAudioSession(bool triggered_by_button) {
             tx_mono[i] = rx_stereo[i * 2 + ch_offset];
         }
 
-        // Stream framed packet to Mac over USB Serial: 0xAA 0x55 <len_lo> <len_hi> <pcm...>
+        // Stream framed packet over USB Serial: 0xAA 0x55 <len_lo> <len_hi> <pcm...>
         uint8_t pkt_hdr[4];
         pkt_hdr[0] = 0xAA;
         pkt_hdr[1] = 0x55;
@@ -367,12 +462,10 @@ void recordAudioSession(bool triggered_by_button) {
             uint32_t elapsed = millis() - start_time;
 
             if (elapsed > 350 && btn_down) {
-                // Button held > 350ms: activate Push-to-Talk mode
                 is_push_to_talk = true;
             }
 
             if (is_push_to_talk) {
-                // Push-to-Talk: stop immediately when user releases button
                 if (!btn_down) {
                     delay(20);
                     if ((digitalRead(BUTTON_BOOT_PIN) == HIGH) && (digitalRead(BUTTON_WHEEL_PIN) == HIGH)) {
@@ -380,23 +473,19 @@ void recordAudioSession(bool triggered_by_button) {
                     }
                 }
             } else {
-                // Tap mode:
                 if (!btn_down) {
                     button_was_released = true;
                 }
-                // Second tap stops early
                 if (button_was_released && btn_down && elapsed > 400) {
                     delay(30);
                     break;
                 }
-                // Default tap duration: 5 seconds
                 if (elapsed >= 5000) {
                     break;
                 }
             }
         }
 
-        // Allow stopping via serial input ('s', 'q', or newline)
         if (Serial.available()) {
             char c = Serial.peek();
             if (c == 's' || c == 'S' || c == 'q' || c == 'Q' || c == '\n' || c == '\r') {
@@ -406,23 +495,21 @@ void recordAudioSession(bool triggered_by_button) {
         }
     }
 
-    // Send clean End-of-Stream packet: 0xAA 0x55 0x00 0x00
     uint8_t eos[4] = { 0xAA, 0x55, 0x00, 0x00 };
     Serial.write(eos, 4);
     Serial.flush();
 
     Serial.printf("\nRECORD_DONE:%u\n", g_recorded_count);
 
-    // Re-enable PA
     if (pa_enabled) {
         digitalWrite(PA_CTRL_PIN, HIGH);
         delay(20);
-        // Play quick completion beep
         playTone(800.0f, 40, 0.3f);
     }
 
     Serial.printf(">>> Audio recording finished (%u samples, %.2f s). Streamed over USB!\n",
                   g_recorded_count, (float)g_recorded_count / SAMPLE_RATE);
+    g_local_playback_active = false;
 }
 
 void playRecordedAudio() {
@@ -430,6 +517,7 @@ void playRecordedAudio() {
         Serial.println(">>> No recorded audio in buffer to play!");
         return;
     }
+    g_local_playback_active = true;
     Serial.printf(">>> Playing last recorded audio (%u samples, %.2f s)...\n",
                   g_recorded_count, (float)g_recorded_count / SAMPLE_RATE);
 
@@ -449,23 +537,18 @@ void playRecordedAudio() {
         samples_played += count;
     }
     Serial.println(">>> Recorded audio playback finished.");
+    g_local_playback_active = false;
 }
 
 void setup() {
-    Serial.begin(115200);
-    Serial.setRxBufferSize(8192);
-    delay(1000); // Allow USB Serial to attach
-
-    Serial.println("\r\n==========================================");
-    Serial.println("  ESP32-S3 e-Paper 3.97 Audio & Mic Engine");
-    Serial.println("==========================================");
+    USBSerial.begin(115200);
+    USBSerial.setRxBufferSize(8192);
 
     // Initialize Buttons (Active LOW with internal pull-up resistors)
     pinMode(BUTTON_BOOT_PIN, INPUT_PULLUP);
     pinMode(BUTTON_WHEEL_PIN, INPUT_PULLUP);
     pinMode(BUTTON_UP_PIN, INPUT_PULLUP);
     pinMode(BUTTON_DOWN_PIN, INPUT_PULLUP);
-    Serial.println("Buttons initialized (BOOT=GPIO 0, WHEEL=GPIO 5, UP=4, DOWN=6).");
 
     // Allocate PSRAM Recording Buffer
     g_recorded_audio = (int16_t *)heap_caps_malloc(g_max_record_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
@@ -474,33 +557,81 @@ void setup() {
         g_max_record_samples = SAMPLE_RATE * 5;
         g_recorded_audio = (int16_t *)malloc(g_max_record_samples * sizeof(int16_t));
     }
-    if (g_recorded_audio) {
-        Serial.printf("  Record buffer allocated: %u samples (%.1f s)\n",
-                      g_max_record_samples, (float)g_max_record_samples / SAMPLE_RATE);
-    }
 
     // Initialize I2C
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 100000);
     scanI2C();
 
     // Enable Power Amplifier (PA_CTRL = GPIO 39)
-    Serial.println("[3/3] Enabling Power Amplifier (GPIO 39 -> HIGH)...");
     pinMode(PA_CTRL_PIN, OUTPUT);
     digitalWrite(PA_CTRL_PIN, HIGH);
     pa_enabled = true;
     delay(50);
 
-    // Initialize Codec & I2S
-    if (!initCodec()) {
-        Serial.println("CRITICAL: Codec init failed! Check connections.");
-        return;
-    }
+    // Initialize I2S first to supply MCLK (GPIO 13) and BCLK to ES8311
     if (!initI2S()) {
         Serial.println("CRITICAL: I2S init failed!");
         return;
     }
+    if (!initCodec()) {
+        Serial.println("CRITICAL: Codec init failed! Check connections.");
+        return;
+    }
+    // Re-apply microphone configuration with active MCLK
+    es8311_microphone_config(es_handle, false);
+    es8311_microphone_gain_set(es_handle, (es8311_mic_gain_t)current_mic_gain);
 
-    Serial.println("\nAll audio subsystems initialized successfully!");
+    // Configure USB Audio Class 2.0 (UAC2) Device for Linux ALSA recognition
+    auto usb_cfg = usb_audio.defaultConfig(RXTX_MODE);
+    usb_cfg.sample_rate = SAMPLE_RATE; // 48000 Hz
+    usb_cfg.channels = 2;              // Stereo (standard for UAC2)
+    usb_cfg.bits_per_sample = 16;
+    usb_cfg.product = "ESP32-S3 Audio (ALSA)";
+    usb_cfg.enable_feedback_ep = true;
+    usb_cfg.fifo_packets = 32;
+
+    usb_audio.begin(usb_cfg);
+
+    // Format correction callback (10.14 format required by macOS CoreAudio)
+    usb_audio.setAudioFeedbackFormatCorrectionCallback([](USBAudioDeviceBase*, uint8_t) {
+        return true;
+    });
+
+    // Hook ALSA Mixer volume and mute callbacks to hardware ES8311 Codec & Power Amp
+    usb_audio.setVolumeCallback([](float vol, uint8_t ch) {
+        current_volume = (int)(vol * 100.0f);
+        if (current_volume < 0) current_volume = 0;
+        if (current_volume > 100) current_volume = 100;
+        if (es_handle) {
+            es8311_voice_volume_set(es_handle, current_volume, NULL);
+        }
+        Serial.printf("[ALSA Mixer] Volume: %d%%\n", current_volume);
+    });
+
+    usb_audio.setMuteCallback([](bool mute, uint8_t ch) {
+        digitalWrite(PA_CTRL_PIN, (mute || !pa_enabled) ? LOW : HIGH);
+        Serial.printf("[ALSA Mixer] %s\n", mute ? "MUTED" : "UNMUTED");
+    });
+
+    // Start TinyUSB Stack (enables Composite USB: USB Audio + USB CDC Serial)
+    USB.begin();
+
+    // Start background audio bridge task on Core 0 (Priority 5, 8KB stack)
+    xTaskCreatePinnedToCore(
+        audioBridgeTask,
+        "audio_bridge",
+        8192,
+        NULL,
+        5,
+        &s_audio_task_handle,
+        0 // Pin to Core 0
+    );
+
+    Serial.println("\r\n==========================================");
+    Serial.println("  ESP32-S3 e-Paper 3.97 ALSA USB Audio Engine");
+    Serial.println("  [USB Audio Class 2.0 (UAC2) + USB CDC Serial]");
+    Serial.println("==========================================");
+    Serial.printf("Audio Mode: 48,000 Hz 16-bit Stereo Duplex (Mic + Speaker)\n");
     Serial.println("Dumping ES8311 registers:");
     es8311_register_dump(es_handle);
     Serial.println();
@@ -508,8 +639,8 @@ void setup() {
     Serial.println("\n==========================================");
     Serial.println("Interactive Controls:");
     Serial.println("  [Hardware Button]: Press BOOT (GPIO 0) or Rotary (GPIO 5) to Record");
-    Serial.println("  'R' : Record audio from mic & stream to Mac over USB");
-    Serial.println("  'S' : USB Audio Stream mode (play audio streamed from Mac)");
+    Serial.println("  'R' : Record audio from mic & stream over USB Serial");
+    Serial.println("  'S' : Legacy USB Serial Stream receiver mode");
     Serial.println("  '4' : Replay last recorded audio on onboard speaker");
     Serial.println("  '1' : Play diagnostic test beeps");
     Serial.println("  '2' : Play chime melody");
@@ -586,6 +717,47 @@ static void handleAudioCommand(char cmd) {
             digitalWrite(PA_CTRL_PIN, pa_enabled ? HIGH : LOW);
             Serial.printf("Power Amplifier (PA_CTRL) is now %s\n", pa_enabled ? "ENABLED" : "DISABLED");
             break;
+        case 'd':
+        case 'D': {
+            Serial.println("\n=== Audio Diagnostics ===");
+            Serial.printf("USB Audio mounted: %d\n", usb_audio.mounted());
+            Serial.printf("USB Streaming Rx (Speaker): %d, Tx (Mic): %d\n", usb_audio.isStreamingActiveRx(), usb_audio.isStreamingActiveTx());
+            Serial.printf("USB Rx available bytes: %d, Tx space available: %d\n", usb_audio.available(), usb_audio.availableForWrite());
+            Serial.printf("USB Tx xfer count: %u, Rx xfer count: %u\n", 
+                          usb_audio.getTxXferCount(), usb_audio.getRxXferCount());
+            Serial.printf("USB speed: %d, Tx frame_bytes_last: %u, Tx xferred_last: %u, Tx fifo read: %u\n",
+                          tud_speed_get(), usb_audio.getTxFrameBytesLast(), usb_audio.getTxXferredLast(), usb_audio.getTxFifoReadTotal());
+            Serial.printf("SET_ITF count: %u, last itf=%u, alt=%u, func=%u, idx=%u\n",
+                          usb_audio.getSetItfCount(), usb_audio.getLastSetItf(),
+                          usb_audio.getLastSetAlt(), usb_audio.getLastFuncId(),
+                          usb_audio.getLastIdxItf());
+            Serial.printf("Open EPs: IN ep=0x%02x rc=%u | OUT ep=0x%02x rc=%u\n",
+                          usb_audio.getLastOpenEpIn(), usb_audio.getOpenEpInRc(),
+                          usb_audio.getLastOpenEpOut(), usb_audio.getOpenEpOutRc());
+            int16_t test_buf[64 * 2];
+            size_t bytes_read = 0;
+            esp_err_t err = i2s_read(I2S_NUM, test_buf, sizeof(test_buf), &bytes_read, pdMS_TO_TICKS(50));
+            Serial.printf("I2S read test: err=0x%x, bytes_read=%u\n", err, bytes_read);
+            if (bytes_read >= 4) {
+                int samples = bytes_read / 4;
+                int64_t mag_l = 0, mag_r = 0;
+                for (int i = 0; i < samples; i++) {
+                    mag_l += abs((int32_t)test_buf[i * 2]);
+                    mag_r += abs((int32_t)test_buf[i * 2 + 1]);
+                }
+                Serial.printf("Sample[0]: L=%d, R=%d | Sample[1]: L=%d, R=%d | mag_l=%lld, mag_r=%lld\n",
+                              test_buf[0], test_buf[1], test_buf[2], test_buf[3], mag_l, mag_r);
+            }
+            break;
+        }
+        case 'b':
+        case 'B': {
+            Serial.println("Rebooting to ROM bootloader mode...");
+            Serial.flush();
+            delay(100);
+            usb_persist_restart(RESTART_BOOTLOADER);
+            break;
+        }
         default:
             break;
     }
@@ -616,6 +788,11 @@ void loop() {
             if (s_chatSerialBuffer.length() > 0) {
                 if (s_chatSerialBuffer.length() == 1) {
                     handleAudioCommand(s_chatSerialBuffer[0]);
+                } else if (s_chatSerialBuffer.equalsIgnoreCase("/bootloader") || s_chatSerialBuffer.equalsIgnoreCase("/boot")) {
+                    Serial.println("Rebooting to ROM bootloader mode...");
+                    Serial.flush();
+                    delay(100);
+                    usb_persist_restart(RESTART_BOOTLOADER);
                 } else if (s_chatSerialBuffer.startsWith("/") || s_chatSerialBuffer.startsWith("{") ||
                            s_chatSerialBuffer.startsWith("USER:") || s_chatSerialBuffer.startsWith("user:") ||
                            s_chatSerialBuffer.startsWith("AGENT:") || s_chatSerialBuffer.startsWith("agent:") ||
@@ -633,7 +810,7 @@ void loop() {
             }
             s_chatSerialBuffer = "";
         } else {
-            // Check for instantaneous single keystrokes like 'S' for audio stream
+            // Check for instantaneous single keystrokes like 'S' for legacy audio stream
             if (s_chatSerialBuffer.length() == 0 && (c == 's' || c == 'S')) {
                 handleStreamAudio();
             } else {

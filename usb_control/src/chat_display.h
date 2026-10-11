@@ -2,6 +2,11 @@
 #define _CHAT_DISPLAY_H_
 
 #include <Arduino.h>
+#include <USBCDC.h>
+extern USBCDC USBSerial;
+#ifndef Serial
+#define Serial USBSerial
+#endif
 #include "DEV_Config.h"
 #include "EPD_3in97.h"
 #include "GUI_Paint.h"

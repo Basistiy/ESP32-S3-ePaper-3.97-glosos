@@ -6,14 +6,15 @@ Firmware, display drivers, and real-time USB audio streaming tools for the **Wav
 
 ## 📋 Features
 
-- 🔊 **Audio & USB Control Subsystem (`usb_control`)**
+- 🔊 **Native USB Audio Class Subsystem (`usb_control`)**
+  - **ALSA Sound Card (Linux / macOS / Windows)**: Enumerates as a standard USB Audio Class 2.0 (UAC2) sound card recognized automatically by Linux `snd-usb-audio` (`arecord` & `aplay`), macOS CoreAudio, and Windows WASAPI without custom drivers.
+  - **48 kHz 16-bit Full-Duplex Audio**: High-fidelity 48 kHz stereo playback (to speaker) and continuous capture (from ES8311 mic).
+  - **ALSA Mixer Hardware Integration**: Volume sliders and mute buttons in `alsamixer` or system sound settings directly control the ES8311 hardware codec and onboard Power Amplifier.
+  - **Composite USB Device**: Runs USB Audio and USB CDC Serial concurrently over the same physical USB cable—enabling simultaneous audio streaming and e-Paper chat updates.
   - **ES8311 Codec Control**: Full initialization over I2C, volume control, microphone gain, and clock management.
   - **Onboard Power Amplifier**: GPIO 39 active-high PA control.
-  - **I2S Master Clocking**: 24 kHz 16-bit audio with MCLK output on GPIO 13.
-  - **Microphone Capture**: Low-noise 24 kHz 16-bit voice recording via ES8311 ADC and I2S DIN (GPIO 21).
-  - **Push-to-Talk & Tap-to-Record**: Trigger recording using onboard **BOOT button (GPIO 0)** or **Rotary Wheel press (GPIO 5)**.
-  - **Real-Time USB Audio Streaming**: Stream audio bidirectionally (Mac → Speaker or Microphone → Mac) over native USB CDC.
-  - **Packet Framing Protocol**: Custom `0xAA 0x55` sync framing that eliminates byte alignment errors and white-noise static.
+  - **I2S Master Clocking**: 48 kHz 16-bit audio with MCLK output on GPIO 13 (12.288 MHz).
+  - **Microphone Capture**: Low-noise voice recording via ES8311 ADC and I2S DIN (GPIO 21).
   - **Onboard Synthesizer & Replay**: Pure sine wave tone generator, chime melodies, flash music, and instant replay of recorded voice.
 
 - 🖼️ **e-Paper Chat Display Subsystem (`display_firmware` & `usb_control`)**
@@ -217,7 +218,42 @@ python3 stream_to_esp32.py /System/Library/Sounds/Sosumi.aiff
 
 ---
 
-### 4. Send Messages as Chat Bubbles to the e-Paper Display
+### 4. Use as a Native ALSA Sound Card on Linux
+
+When plugged into any Linux computer (Raspberry Pi, Ubuntu, Debian, Arch, etc.), the board is recognized natively by the Linux kernel's `snd-usb-audio` driver as a standard ALSA sound card:
+
+#### Check ALSA Audio Devices:
+```bash
+# List playback devices (ESP32 speaker)
+aplay -l
+
+# List capture devices (ESP32 microphone)
+arecord -l
+```
+
+#### Record Audio from Onboard Microphone:
+```bash
+arecord -D plughw:CARD=Audio,DEV=0 -f S16_LE -r 48000 -c 2 -d 5 mic_test.wav
+```
+
+#### Play Audio through Onboard Speaker:
+```bash
+aplay -D plughw:CARD=Audio,DEV=0 mic_test.wav
+```
+
+#### Adjust Volume & Mute in Terminal:
+```bash
+alsamixer
+```
+
+#### Run Automated Test:
+```bash
+./test_alsa.sh
+```
+
+---
+
+### 5. Send Messages as Chat Bubbles to the e-Paper Display
 
 Messages sent from your Mac are rendered as clean chat bubbles in **vertical (portrait 480×800) orientation**:
 - **Pure Bubble Interface**: All headers, footers, and divider lines are removed — only chat bubbles appear on the canvas.
