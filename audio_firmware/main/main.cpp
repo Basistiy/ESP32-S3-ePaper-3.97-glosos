@@ -159,15 +159,25 @@ static void codec_es8311_init(void)
         .tx_handle = s_i2s_tx_handle,
     };
     const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&i2s_cfg);
+    const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();
 
     es8311_codec_cfg_t es8311_cfg = {
         .ctrl_if = ctrl_if,
+        .gpio_if = gpio_if,
+        .codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH,
         .pa_pin = PA_CTRL_PIN,
+        .pa_reverted = false,
+        .master_mode = false,
         .use_mclk = true,
+        .digital_mic = false,
+        .invert_mclk = false,
+        .invert_sclk = false,
         .hw_gain = {
             .pa_voltage = 5.0,
             .codec_dac_voltage = 3.3,
         },
+        .no_dac_ref = false,
+        .mclk_div = (uint16_t)CODEC_MCLK_MULTIPLE,
     };
     const audio_codec_if_t *codec_if = es8311_codec_new(&es8311_cfg);
 
@@ -190,6 +200,19 @@ static void codec_es8311_init(void)
     ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(s_codec_handle, DEFAULT_VOLUME));
     ESP_ERROR_CHECK(esp_codec_dev_set_in_gain(s_codec_handle, DEFAULT_MIC_GAIN));
     ESP_ERROR_CHECK(esp_codec_dev_set_out_mute(s_codec_handle, false));
+
+    // Force hardware registers to known good state matching Waveshare reference driver
+    esp_codec_dev_write_reg(s_codec_handle, 0x00, 0x80); // Power on chip in slave mode
+    esp_codec_dev_write_reg(s_codec_handle, 0x0D, 0x01); // Power up analog circuitry
+    esp_codec_dev_write_reg(s_codec_handle, 0x0E, 0x02); // Enable analog PGA and ADC modulator
+    esp_codec_dev_write_reg(s_codec_handle, 0x12, 0x00); // Power up DAC
+    esp_codec_dev_write_reg(s_codec_handle, 0x13, 0x10); // Enable output to HP/speaker drive
+    esp_codec_dev_write_reg(s_codec_handle, 0x31, 0x00); // Digital unmute DAC
+    esp_codec_dev_write_reg(s_codec_handle, 0x32, 0xBF); // DAC digital volume (~75%)
+    esp_codec_dev_write_reg(s_codec_handle, 0x37, 0x08); // Bypass DAC equalizer
+
+    // Ensure NS4150B power amplifier is enabled
+    pa_power_enable(true);
 
     ESP_LOGI(TAG, "ES8311 codec configured (Volume: %d%%, Mic Gain: %d dB)", DEFAULT_VOLUME, DEFAULT_MIC_GAIN);
 }
@@ -218,13 +241,13 @@ static void play_tone(float freq_hz, int duration_ms, float volume)
 static void play_boot_chime(void)
 {
     ESP_LOGI(TAG, "Playing hardware startup chime...");
-    play_tone(523.25f, 100, 0.35f); // C5
-    vTaskDelay(pdMS_TO_TICKS(15));
-    play_tone(659.25f, 100, 0.35f); // E5
-    vTaskDelay(pdMS_TO_TICKS(15));
-    play_tone(783.99f, 100, 0.35f); // G5
-    vTaskDelay(pdMS_TO_TICKS(15));
-    play_tone(1046.50f, 220, 0.40f); // C6
+    play_tone(523.25f, 120, 0.60f); // C5
+    vTaskDelay(pdMS_TO_TICKS(20));
+    play_tone(659.25f, 120, 0.60f); // E5
+    vTaskDelay(pdMS_TO_TICKS(20));
+    play_tone(783.99f, 120, 0.60f); // G5
+    vTaskDelay(pdMS_TO_TICKS(20));
+    play_tone(1046.50f, 250, 0.70f); // C6
     vTaskDelay(pdMS_TO_TICKS(50));
 }
 
@@ -313,12 +336,18 @@ static void chat_cdc_task(void *arg)
 
                     if (strlen(rx_buf) > 0) {
                         ESP_LOGI("CHAT", "Received command: \"%s\"", rx_buf);
-                        bool handled = ChatDisplay::handleCommand(rx_buf);
-                        if (!handled) {
-                            ChatDisplay::addMessage(SENDER_USER, rx_buf);
+                        if (strcasecmp(rx_buf, "/beep") == 0 || strcasecmp(rx_buf, "/testaudio") == 0) {
+                            play_tone(880.0f, 300, 0.60f);
+                            tud_cdc_n_write(0, "BEEP OK\r\n", 9);
+                            tud_cdc_n_write_flush(0);
+                        } else {
+                            bool handled = ChatDisplay::handleCommand(rx_buf);
+                            if (!handled) {
+                                ChatDisplay::addMessage(SENDER_USER, rx_buf);
+                            }
+                            tud_cdc_n_write(0, "OK\r\n", 4);
+                            tud_cdc_n_write_flush(0);
                         }
-                        tud_cdc_n_write(0, "OK\r\n", 4);
-                        tud_cdc_n_write_flush(0);
                     }
 
                     size_t processed = (newline_pos - rx_buf) + 1;

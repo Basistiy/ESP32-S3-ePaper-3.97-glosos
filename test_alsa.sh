@@ -8,34 +8,36 @@
 
 set -euo pipefail
 
-CARD_NAME="Device"
+# Auto-detect card name or index
+detect_card() {
+    local matched
+    matched=$(aplay -l 2>/dev/null | grep -E "Display|ESP32-S3|ESP UAC Device|Device" | head -n 1 || true)
+    if [ -n "${matched}" ]; then
+        CARD_NAME=$(echo "${matched}" | sed -n 's/.*card [0-9]*: \([^ :\[]*\).*/\1/p')
+        [ -z "${CARD_NAME}" ] && CARD_NAME="Display"
+        echo "Detected ESP Audio device: [${CARD_NAME}]"
+    else
+        CARD_NAME="Display"
+    fi
+}
+
+detect_card
+CARD_NAME="${CARD_NAME:-Display}"
 DEV_INDEX=0
 SAMPLE_RATE=16000
 CHANNELS=1
 FORMAT="S16_LE"
 TEST_FILE="test_esp32_audio.wav"
-
-# Check if card is present
-find_card() {
-    if aplay -l 2>/dev/null | grep -q "ESP UAC Device"; then
-        echo "Found 'ESP UAC Device' in ALSA playback devices."
-    elif arecord -l 2>/dev/null | grep -q "ESP UAC Device"; then
-        echo "Found 'ESP UAC Device' in ALSA capture devices."
-    else
-        echo "WARNING: 'ESP UAC Device' not found in aplay -l or arecord -l."
-        echo "Available playback devices:"
-        aplay -l 2>/dev/null || true
-        echo "Available capture devices:"
-        arecord -l 2>/dev/null || true
-    fi
-}
-
 ALSA_DEVICE="plughw:CARD=${CARD_NAME},DEV=${DEV_INDEX}"
 
 cmd_info() {
-    echo "=== ALSA Devices ==="
-    find_card
+    echo "=== ALSA Playback Devices ==="
+    aplay -l 2>/dev/null || true
     echo ""
+    echo "=== ALSA Capture Devices ==="
+    arecord -l 2>/dev/null || true
+    echo ""
+    echo "Target ALSA Device: ${ALSA_DEVICE}"
     echo "=== ALSA Mixer Controls (amixer -c ${CARD_NAME}) ==="
     amixer -c "${CARD_NAME}" 2>/dev/null || echo "(No hardware mixer or card not found)"
 }

@@ -150,6 +150,18 @@ python3 send_chat.py --rotate
 # (Or press the physical BOOT button on the board)
 ```
 
+#### No-Python Environment (e.g. OpenStick / Minimal Linux):
+Compile and use the standalone C binary [`send_chat_raw.c`](file:///Users/evgeniibasistyi/Documents/GitHub/ESP32-S3-ePaper-3.97-glosos/send_chat_raw.c), which communicates directly over raw USB usbfs without requiring Python or the `cdc_acm` kernel module:
+
+```bash
+gcc -O2 send_chat_raw.c -o send_chat
+./send_chat "/agent Hello from pure C!"
+./send_chat "/user Testing without Python"
+./send_chat "/demo"
+./send_chat "/rotate"
+./send_chat "/clear"
+```
+
 ---
 
 ### 3. Record & Play Audio (Linux / ALSA)
