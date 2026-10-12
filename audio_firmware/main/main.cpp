@@ -14,6 +14,8 @@
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_timer.h"
 #include "driver/i2s_std.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
@@ -42,6 +44,9 @@ static const char *TAG = "unified_fw";
 #define PA_CTRL_PIN             CONFIG_EXAMPLE_PA_CTRL_IO
 
 #define BUTTON_BOOT_PIN         (0)
+#define BUTTON_WHEEL_PIN        (5)
+#define BUTTON_UP_PIN           (4)
+#define BUTTON_DOWN_PIN         (6)
 
 /* Audio stream parameters */
 #define AUDIO_SAMPLE_RATE       CONFIG_UAC_SAMPLE_RATE
@@ -310,6 +315,21 @@ static void usb_uac_init(void)
 }
 
 /* -------------------------------------------------------------------------
+ * Thread-Safe CDC Serial Sender
+ * ------------------------------------------------------------------------- */
+static SemaphoreHandle_t s_cdc_tx_mutex = NULL;
+
+static void cdc_send_line(const char *line)
+{
+    if (!s_cdc_tx_mutex || !line) return;
+    if (xSemaphoreTake(s_cdc_tx_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        tud_cdc_n_write(0, line, strlen(line));
+        tud_cdc_n_write_flush(0);
+        xSemaphoreGive(s_cdc_tx_mutex);
+    }
+}
+
+/* -------------------------------------------------------------------------
  * CDC Chat Serial Task (receives /user, /agent, /clear, /rotate, /demo, JSON)
  * ------------------------------------------------------------------------- */
 static void chat_cdc_task(void *arg)
@@ -338,15 +358,13 @@ static void chat_cdc_task(void *arg)
                         ESP_LOGI("CHAT", "Received command: \"%s\"", rx_buf);
                         if (strcasecmp(rx_buf, "/beep") == 0 || strcasecmp(rx_buf, "/testaudio") == 0) {
                             play_tone(880.0f, 300, 0.60f);
-                            tud_cdc_n_write(0, "BEEP OK\r\n", 9);
-                            tud_cdc_n_write_flush(0);
+                            cdc_send_line("BEEP OK\r\n");
                         } else {
                             bool handled = ChatDisplay::handleCommand(rx_buf);
                             if (!handled) {
                                 ChatDisplay::addMessage(SENDER_USER, rx_buf);
                             }
-                            tud_cdc_n_write(0, "OK\r\n", 4);
-                            tud_cdc_n_write_flush(0);
+                            cdc_send_line("OK\r\n");
                         }
                     }
 
@@ -363,32 +381,85 @@ static void chat_cdc_task(void *arg)
 }
 
 /* -------------------------------------------------------------------------
- * Hardware Button Task (BOOT button on GPIO 0 toggles orientation)
+ * Hardware Button Tracking & USB Event Transmission
  * ------------------------------------------------------------------------- */
+typedef struct {
+    gpio_num_t pin;
+    const char *id;
+    bool is_pressed;
+    bool last_raw_pressed;
+    uint32_t debounce_timer;
+    uint32_t press_start_ms;
+} button_input_t;
+
+static button_input_t s_buttons[] = {
+    { (gpio_num_t)BUTTON_BOOT_PIN,  "boot",        false, false, 0, 0 },
+    { (gpio_num_t)BUTTON_WHEEL_PIN, "wheel_click", false, false, 0, 0 },
+    { (gpio_num_t)BUTTON_UP_PIN,    "wheel_up",    false, false, 0, 0 },
+    { (gpio_num_t)BUTTON_DOWN_PIN,  "wheel_down",  false, false, 0, 0 }
+};
+
 static void button_task(void *arg)
 {
-    gpio_config_t btn_cfg = {
-        .pin_bit_mask = (1ULL << BUTTON_BOOT_PIN),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&btn_cfg);
+    for (size_t i = 0; i < sizeof(s_buttons) / sizeof(s_buttons[0]); i++) {
+        gpio_config_t btn_cfg = {
+            .pin_bit_mask = (1ULL << s_buttons[i].pin),
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&btn_cfg);
+    }
+
+    // Allow internal pull-ups to stabilize
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    for (size_t i = 0; i < sizeof(s_buttons) / sizeof(s_buttons[0]); i++) {
+        bool raw_pressed = (gpio_get_level(s_buttons[i].pin) == 0);
+        s_buttons[i].is_pressed = raw_pressed;
+        s_buttons[i].last_raw_pressed = raw_pressed;
+        s_buttons[i].debounce_timer = now;
+        s_buttons[i].press_start_ms = now;
+    }
+
+    const uint32_t DEBOUNCE_MS = 25;
+    char msg[128];
 
     while (1) {
-        if (gpio_get_level((gpio_num_t)BUTTON_BOOT_PIN) == 0) {
-            vTaskDelay(pdMS_TO_TICKS(40));
-            if (gpio_get_level((gpio_num_t)BUTTON_BOOT_PIN) == 0) {
-                ESP_LOGI(TAG, "BOOT button pressed -> Toggling display orientation...");
-                ChatDisplay::toggleRotation();
-                while (gpio_get_level((gpio_num_t)BUTTON_BOOT_PIN) == 0) {
-                    vTaskDelay(pdMS_TO_TICKS(30));
+        now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+
+        for (size_t i = 0; i < sizeof(s_buttons) / sizeof(s_buttons[0]); i++) {
+            button_input_t *b = &s_buttons[i];
+            bool raw_pressed = (gpio_get_level(b->pin) == 0);
+
+            if (raw_pressed != b->last_raw_pressed) {
+                b->last_raw_pressed = raw_pressed;
+                b->debounce_timer = now;
+            }
+
+            if ((now - b->debounce_timer) >= DEBOUNCE_MS) {
+                if (raw_pressed && !b->is_pressed) {
+                    // Transition: RELEASED -> PRESSED
+                    b->is_pressed = true;
+                    b->press_start_ms = now;
+                    ESP_LOGI(TAG, "Button '%s' PRESSED", b->id);
+                    snprintf(msg, sizeof(msg), "{\"event\":\"button\",\"id\":\"%s\",\"state\":\"press\"}\r\n", b->id);
+                    cdc_send_line(msg);
+                } else if (!raw_pressed && b->is_pressed) {
+                    // Transition: PRESSED -> RELEASED
+                    b->is_pressed = false;
+                    uint32_t duration_ms = now - b->press_start_ms;
+                    ESP_LOGI(TAG, "Button '%s' RELEASED (duration: %u ms)", b->id, (unsigned)duration_ms);
+                    snprintf(msg, sizeof(msg), "{\"event\":\"button\",\"id\":\"%s\",\"state\":\"release\",\"duration_ms\":%u}\r\n",
+                             b->id, (unsigned)duration_ms);
+                    cdc_send_line(msg);
                 }
-                vTaskDelay(pdMS_TO_TICKS(100));
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
+
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -434,7 +505,10 @@ extern "C" void app_main(void)
     /* 7. Register Composite USB Stack (CDC Serial + UAC Audio) */
     usb_uac_init();
 
-    /* 8. Start Background Tasks on Core 0 */
+    /* 8. Initialize CDC Mutex for thread-safe transmission */
+    s_cdc_tx_mutex = xSemaphoreCreateMutex();
+
+    /* 9. Start Background Tasks on Core 0 */
     xTaskCreatePinnedToCore(chat_cdc_task, "chat_cdc", 12288, NULL, 3, NULL, 0);
     xTaskCreatePinnedToCore(button_task, "button_task", 8192, NULL, 2, NULL, 0);
 
