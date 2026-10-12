@@ -38,9 +38,9 @@ extern "C" {
 
 static inline void DEV_Delay_ms(uint32_t ms)
 {
-    if (ms >= 10 && xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
-        vTaskDelay(pdMS_TO_TICKS(ms));
-    } else {
+    if (ms > 0 && xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+        vTaskDelay(pdMS_TO_TICKS(ms) ? pdMS_TO_TICKS(ms) : 1);
+    } else if (ms > 0) {
         esp_rom_delay_us(ms * 1000);
     }
 }

@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "DEV_Config.h"
 #include "EPD_3in97.h"
 #include "GUI_Paint.h"
@@ -45,6 +47,7 @@ private:
     static ChatMessage s_messages[MAX_CHAT_MESSAGES];
     static int s_messageCount;
     static bool s_initialized;
+    static SemaphoreHandle_t s_mutex;
 
     // Drawing helpers
     static void drawRoundedRect(int x0, int y0, int x1, int y1, int r, uint16_t color, bool filled);

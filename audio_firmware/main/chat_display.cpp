@@ -4,14 +4,18 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_attr.h"
+#include "esp_system.h"
 
 static const char *TAG = "ChatDisplay";
 
 UBYTE *ChatDisplay::s_frameBuffer = NULL;
-uint16_t ChatDisplay::s_rotation = ROTATE_270;
-ChatMessage ChatDisplay::s_messages[MAX_CHAT_MESSAGES];
-int ChatDisplay::s_messageCount = 0;
+RTC_DATA_ATTR uint16_t ChatDisplay::s_rotation = ROTATE_270;
+RTC_DATA_ATTR ChatMessage ChatDisplay::s_messages[MAX_CHAT_MESSAGES];
+RTC_DATA_ATTR int ChatDisplay::s_messageCount = 0;
+RTC_DATA_ATTR static uint32_t s_rtc_magic = 0;
 bool ChatDisplay::s_initialized = false;
+SemaphoreHandle_t ChatDisplay::s_mutex = NULL;
 
 // Bubble typography and layout constants using solely Font24
 static const int CHAR_W = 17;        // Font24 width (17 px)
@@ -27,7 +31,17 @@ static const int BOTTOM_MARGIN = 20; // Bottom screen margin
 static const int CORNER_RADIUS = 10; // Bubble corner roundness
 
 bool ChatDisplay::begin(uint16_t initial_rotation) {
-    s_rotation = initial_rotation;
+    if (!s_mutex) {
+        s_mutex = xSemaphoreCreateMutex();
+    }
+
+    esp_reset_reason_t reason = esp_reset_reason();
+    if (reason == ESP_RST_POWERON || s_rtc_magic != 0x43484154) {
+        s_messageCount = 0;
+        s_rotation = initial_rotation;
+        s_rtc_magic = 0x43484154;
+    }
+
     ESP_LOGI(TAG, "Initializing e-Paper Hardware...");
     DEV_Module_Init();
 
@@ -52,8 +66,12 @@ bool ChatDisplay::begin(uint16_t initial_rotation) {
     Paint_SetScale(2); // 1-bit B/W
 
     s_initialized = true;
-    refresh();
-    ESP_LOGI(TAG, "Initialization complete. Chat UI ready with Font24!");
+    if (s_messageCount > 0) {
+        refresh();
+    } else {
+        Paint_Clear(WHITE);
+    }
+    ESP_LOGI(TAG, "Initialization complete. Chat UI ready with Font24! (Messages in history: %d)", s_messageCount);
     return true;
 }
 
@@ -331,6 +349,11 @@ void ChatDisplay::renderMessage(int x, int y, int bubble_w, int bubble_h, const 
 void ChatDisplay::refresh() {
     if (!s_initialized || !s_frameBuffer) return;
 
+    if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(15000)) != pdTRUE) {
+        ESP_LOGW(TAG, "Display mutex busy, skipping refresh");
+        return;
+    }
+
     ESP_LOGI(TAG, "Rendering display canvas...");
     Paint_Clear(WHITE);
 
@@ -340,11 +363,11 @@ void ChatDisplay::refresh() {
             int bubble_h;
             int total_h;
         };
-        MsgLayout layouts[MAX_CHAT_MESSAGES];
+        static MsgLayout layouts[MAX_CHAT_MESSAGES];
 
         int max_chars = (MAX_BUBBLE_WIDTH - PAD_X * 2) / CHAR_W;
 
-        char tmp_lines[14][32];
+        static char tmp_lines[14][32];
         int tmp_count = 0, tmp_len = 0;
         for (int i = 0; i < s_messageCount; i++) {
             wrapMessageText(s_messages[i].text, max_chars, tmp_lines, tmp_count, tmp_len);
@@ -386,6 +409,10 @@ void ChatDisplay::refresh() {
     ESP_LOGI(TAG, "Refreshing e-Paper panel (Fast Base Mode)...");
     EPD_3IN97_Display_Fast_Base(s_frameBuffer);
     ESP_LOGI(TAG, "Screen refresh complete!");
+
+    if (s_mutex) {
+        xSemaphoreGive(s_mutex);
+    }
 }
 
 static std::string trimString(const std::string &str) {

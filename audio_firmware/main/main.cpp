@@ -291,8 +291,8 @@ static void usb_uac_init(void)
  * ------------------------------------------------------------------------- */
 static void chat_cdc_task(void *arg)
 {
-    char rx_buf[1024];
-    size_t rx_len = 0;
+    static char rx_buf[1024];
+    static size_t rx_len = 0;
 
     ESP_LOGI(TAG, "Chat CDC serial listener ready.");
 
@@ -406,8 +406,8 @@ extern "C" void app_main(void)
     usb_uac_init();
 
     /* 8. Start Background Tasks on Core 0 */
-    xTaskCreatePinnedToCore(chat_cdc_task, "chat_cdc", 4096, NULL, 3, NULL, 0);
-    xTaskCreatePinnedToCore(button_task, "button_task", 2048, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(chat_cdc_task, "chat_cdc", 12288, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(button_task, "button_task", 8192, NULL, 2, NULL, 0);
 
     ESP_LOGI(TAG, "Unified system operational: ALSA audio + e-Paper chat ready!");
 }

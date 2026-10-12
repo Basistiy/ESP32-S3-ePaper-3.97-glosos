@@ -84,12 +84,17 @@ class ESP32ChatClient:
         if wait_response:
             t0 = time.time()
             while time.time() - t0 < wait_sec:
-                if self.ser.in_waiting:
-                    line = self.ser.readline().decode("utf-8", errors="ignore").strip()
-                    if line:
-                        responses.append(line)
-                        if line == "OK" or "refresh complete" in line.lower():
-                            break
+                try:
+                    if self.ser.in_waiting:
+                        line = self.ser.readline().decode("utf-8", errors="ignore").strip()
+                        if line:
+                            responses.append(line)
+                            if line == "OK" or "refresh complete" in line.lower():
+                                break
+                except OSError as e:
+                    print(f"  [Warning] Serial communication interrupted: {e}")
+                    self.ser = None
+                    break
                 time.sleep(0.05)
         return responses
 
