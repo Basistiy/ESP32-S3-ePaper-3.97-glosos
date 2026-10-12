@@ -40,7 +40,14 @@ def find_serial_port(preferred_port=None):
     ports = sorted(glob.glob("/dev/cu.usb*"))
     if ports:
         return ports[0]
-    raise RuntimeError("No ESP32 USB serial port (/dev/cu.usbmodem*) found! Check USB connection.")
+    # Linux (Debian / OpenStick / Ubuntu / Raspberry Pi)
+    ports = sorted(glob.glob("/dev/ttyACM*"))
+    if ports:
+        return ports[0]
+    ports = sorted(glob.glob("/dev/ttyUSB*"))
+    if ports:
+        return ports[0]
+    raise RuntimeError("No ESP32 USB serial port (/dev/cu.usbmodem* or /dev/ttyACM*) found! Check USB connection.")
 
 
 class ESP32ChatClient:

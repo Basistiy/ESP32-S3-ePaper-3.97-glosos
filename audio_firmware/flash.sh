@@ -11,9 +11,12 @@ else
     exit 1
 fi
 
-PORT=$(ls -1 /dev/cu.usbmodem* 2>/dev/null | head -n 1 || true)
+if [ -z "${PORT:-}" ]; then
+    PORT=$(ls -1 /dev/cu.usbmodem* /dev/ttyACM* 2>/dev/null | head -n 1 || true)
+fi
+
 if [ -z "$PORT" ]; then
-    echo "⚠️  No /dev/cu.usbmodem* port detected."
+    echo "⚠️  No /dev/cu.usbmodem* or /dev/ttyACM* port detected."
     echo "   Please put the board in Download Mode:"
     echo "   1. Hold the BOOT button (GPIO 0)"
     echo "   2. Tap the RESET button"
